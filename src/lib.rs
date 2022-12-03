@@ -1,0 +1,216 @@
+mod signatures;
+
+use std::{
+    convert::TryInto,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+};
+
+use signatures::{valid, PublicKey, Signature};
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct Forward<'a> {
+    pub address: PublicKey,
+    pub payload: &'a [u8],
+}
+
+impl<'a> Forward<'a> {
+    /// return the Forward type packet or None if the input
+    /// is too short
+    pub fn parse(bs: &'a [u8]) -> Option<Self> {
+        let (public_key, payload) = take_array_ref(bs)?;
+        Some(Self {
+            address: PublicKey(*public_key),
+            payload,
+        })
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct Register {
+    pub address: PublicKey,
+    pub socket_address: SocketAddr,
+    pub timestamp_nanos: u128,
+    pub signature: Signature,
+}
+
+impl Register {
+    /// return the Forward type packet or None if the input
+    /// is not the right size
+    pub fn parse(bs: &[u8]) -> Option<Self> {
+        let (address, bs) = take_array_ref(bs)?;
+        let (socket_address, bs) = take_array_ref(bs)?;
+        let (timestamp_nanos, bs) = take_array_ref(bs)?;
+        let signature = bs.try_into().ok()?;
+        Some(Self {
+            address: PublicKey(*address),
+            socket_address: parse_socketaddr(socket_address),
+            timestamp_nanos: u128::from_be_bytes(*timestamp_nanos),
+            signature: Signature(signature),
+        })
+    }
+
+    /// Check whether the signature is
+    pub fn verify_signature(&self) -> bool {
+        // we should let register just be a reference to an array
+        // then add getters for each field
+        valid(&self.address, todo!(), &self.signature)
+    }
+}
+
+fn parse_socketaddr(dat: &[u8; 18]) -> SocketAddr {
+    let (addr, port) = dat.split_at(16);
+
+    // ipv4 addresses are supported via ipv4-mapped ipv6 addresses
+    let addr: [u8; 16] = addr.try_into().unwrap();
+    let addr = Ipv6Addr::from(addr);
+    let addr = match addr.to_ipv4_mapped() {
+        Some(ipv4) => IpAddr::V4(ipv4),
+        None => IpAddr::V6(addr),
+    };
+
+    let port: [u8; 2] = port.try_into().unwrap();
+    let port = u16::from_be_bytes(port);
+
+    SocketAddr::new(addr, port)
+}
+
+fn take_array_ref<T, const N: usize>(slice: &[T]) -> Option<(&[T; N], &[T])> {
+    if slice.len() < N {
+        return None;
+    }
+    let (a, b) = slice.split_at(N);
+    let a = a.try_into().unwrap();
+    Some((a, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+
+    use super::*;
+
+    #[test]
+    fn parse_forward() {
+        #[rustfmt::skip]
+        let packet = [
+            // public key
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+
+            // payload
+            0x02,
+        ];
+        assert_eq!(
+            Forward::parse(&packet).unwrap(),
+            Forward {
+                address: PublicKey([
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                ]),
+                payload: &[0x02]
+            }
+        )
+    }
+
+    #[test]
+    fn parse_register() {
+        #[rustfmt::skip]
+        let packet = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] public key
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // ]
+                                                            //
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] ipv6 addr ] socket addr ] signature target
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]           ]             ]
+                                                            //             ]             ]
+            0x00, 0x03,                                     // ] port      ]             ]
+                                                            //                           ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] timestamp nanos         ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, // ]                         ]
+                                                            //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] signature
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // ]
+        ];
+        assert_eq!(
+            Register::parse(&packet).unwrap(),
+            Register {
+                address: PublicKey([
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                ]),
+                socket_address: SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::from([
+                        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                    ]),
+                    0x0003,
+                    0,
+                    0,
+                )),
+                timestamp_nanos: 4,
+                signature: Signature([
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+                ])
+            }
+        )
+    }
+
+    #[test]
+    fn socketaddr_parse() {
+        assert_eq!(
+            parse_socketaddr(&[
+                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x06,
+            ]),
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from([
+                    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ]),
+                0x0006,
+                0,
+                0,
+            )),
+        );
+        assert_eq!(
+            parse_socketaddr(&[
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00,
+                0x00, 0x07, 0x00, 0x06,
+            ]),
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from([0x00, 0x00, 0x00, 0x07]),
+                0x0006
+            )),
+        );
+        assert_eq!(
+            parse_socketaddr(&[
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ]),
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from([
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ]),
+                0x0000,
+                0,
+                0,
+            ))
+        );
+    }
+}
