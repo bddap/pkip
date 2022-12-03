@@ -1,6 +1,6 @@
 # Public Key Internet Protocol (address)
 
-Let's use public keys as network addresses.
+WIP
 
 ## License
 
