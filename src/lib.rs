@@ -9,7 +9,7 @@ use signatures::{valid, PublicKey, Signature};
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct Forward<'a> {
-    pub address: PublicKey,
+    pub address: PublicKey<'a>,
     pub payload: &'a [u8],
 }
 
@@ -19,41 +19,81 @@ impl<'a> Forward<'a> {
     pub fn parse(bs: &'a [u8]) -> Option<Self> {
         let (public_key, payload) = take_array_ref(bs)?;
         Some(Self {
-            address: PublicKey(*public_key),
+            address: PublicKey(public_key),
             payload,
         })
     }
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct Register {
-    pub address: PublicKey,
-    pub socket_address: SocketAddr,
-    pub timestamp_nanos: u128,
-    pub signature: Signature,
+pub struct Register<'a> {
+    bs: &'a [u8; Register::REGISTER_SIZE],
 }
 
-impl Register {
+impl<'a> Register<'a> {
+    const PUBLIC_KEY_START: usize = 0;
+    const PUBLIC_KEY_END: usize = Self::PUBLIC_KEY_START + 32;
+    const SOCKET_ADDRESS_START: usize = Self::PUBLIC_KEY_END;
+    const SOCKET_ADDRESS_END: usize = Self::SOCKET_ADDRESS_START + 18;
+    const TIMESTAMP_START: usize = Self::SOCKET_ADDRESS_END;
+    const TIMESTAMP_END: usize = Self::TIMESTAMP_START + 16;
+    const SIGNATURE_START: usize = Self::TIMESTAMP_END;
+    const SIGNATURE_END: usize = Self::TIMESTAMP_END + 64;
+    const REGISTER_SIZE: usize = Self::SIGNATURE_END;
+
     /// return the Forward type packet or None if the input
     /// is not the right size
-    pub fn parse(bs: &[u8]) -> Option<Self> {
-        let (address, bs) = take_array_ref(bs)?;
-        let (socket_address, bs) = take_array_ref(bs)?;
-        let (timestamp_nanos, bs) = take_array_ref(bs)?;
-        let signature = bs.try_into().ok()?;
+    pub fn parse(bs: &'a [u8]) -> Option<Self> {
         Some(Self {
-            address: PublicKey(*address),
-            socket_address: parse_socketaddr(socket_address),
-            timestamp_nanos: u128::from_be_bytes(*timestamp_nanos),
-            signature: Signature(signature),
+            bs: bs.try_into().ok()?,
         })
     }
 
-    /// Check whether the signature is
+    /// Check whether the signature is valid
     pub fn verify_signature(&self) -> bool {
         // we should let register just be a reference to an array
         // then add getters for each field
-        valid(&self.address, todo!(), &self.signature)
+        valid(self.address(), self.signed_message(), self.signature())
+    }
+
+    pub fn address(&self) -> PublicKey<'a> {
+        PublicKey(
+            self.bs[Self::PUBLIC_KEY_START..Self::PUBLIC_KEY_END]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    pub fn socket_address(&self) -> SocketAddr {
+        parse_socketaddr(
+            self.bs[Self::SOCKET_ADDRESS_START..Self::SOCKET_ADDRESS_END]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    pub fn timestamp_nanos(&self) -> u128 {
+        u128::from_be_bytes(
+            self.bs[Self::TIMESTAMP_START..Self::TIMESTAMP_END]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    pub fn signature(&self) -> Signature<'a> {
+        Signature(
+            self.bs[Self::SIGNATURE_START..Self::SIGNATURE_END]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    pub fn signed_message(
+        &self,
+    ) -> &'a [u8; Register::TIMESTAMP_END - Register::SOCKET_ADDRESS_START] {
+        self.bs[Self::SOCKET_ADDRESS_START..Self::TIMESTAMP_END]
+            .try_into()
+            .unwrap()
     }
 }
 
@@ -105,7 +145,7 @@ mod tests {
         assert_eq!(
             Forward::parse(&packet).unwrap(),
             Forward {
-                address: PublicKey([
+                address: PublicKey(&[
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
@@ -141,33 +181,38 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // ]
         ];
+        let r = Register::parse(&packet).unwrap();
         assert_eq!(
-            Register::parse(&packet).unwrap(),
-            Register {
-                address: PublicKey([
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            r.address(),
+            PublicKey(&[
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x01,
+            ])
+        );
+        assert_eq!(
+            r.socket_address(),
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from([
+                    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
                 ]),
-                socket_address: SocketAddr::V6(SocketAddrV6::new(
-                    Ipv6Addr::from([
-                        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00,
-                    ]),
-                    0x0003,
-                    0,
-                    0,
-                )),
-                timestamp_nanos: 4,
-                signature: Signature([
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
-                ])
-            }
-        )
+                0x0003,
+                0,
+                0,
+            ))
+        );
+        assert_eq!(r.timestamp_nanos(), 4);
+        assert_eq!(
+            r.signature(),
+            Signature(&[
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+            ])
+        );
     }
 
     #[test]
@@ -212,5 +257,23 @@ mod tests {
                 0,
             ))
         );
+    }
+
+    /// Check that a random signature does not verify.
+    #[test]
+    fn badsign_verify() {
+        todo!()
+    }
+
+    /// Check that tampered body does not verify.
+    #[test]
+    fn tamper_verify() {
+        todo!()
+    }
+
+    /// Check that properly signed  body does verify.
+    #[test]
+    fn sign_verify() {
+        todo!()
     }
 }

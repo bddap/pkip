@@ -1,14 +1,14 @@
 use ring::signature;
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct PublicKey(pub [u8; 32]);
+pub struct PublicKey<'a>(pub &'a [u8; 32]);
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct Signature(pub [u8; 64]);
+pub struct Signature<'a>(pub &'a [u8; 64]);
 
-pub fn valid(public_key: &PublicKey, message: &[u8], sig: &Signature) -> bool {
-    signature::UnparsedPublicKey::new(&signature::ED25519, &public_key.0)
-        .verify(message, &sig.0)
+pub fn valid(public_key: PublicKey, message: &[u8], sig: Signature) -> bool {
+    signature::UnparsedPublicKey::new(&signature::ED25519, public_key.0)
+        .verify(message, sig.0)
         .is_ok()
 }
 
