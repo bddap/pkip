@@ -6,11 +6,13 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
 };
 
-use signatures::{valid, PublicKey, Signature};
+use signatures::valid;
+
+pub use signatures::{Keypair, PublicKey, Signature};
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct Forward<'a> {
-    pub address: PublicKey<'a>,
+    pub address: PublicKey,
     pub payload: &'a [u8],
 }
 
@@ -20,7 +22,7 @@ impl<'a> Forward<'a> {
     pub fn parse(bs: &'a [u8]) -> Option<Self> {
         let (public_key, payload) = take_array_ref(bs)?;
         Some(Self {
-            address: PublicKey(public_key),
+            address: PublicKey(*public_key),
             payload,
         })
     }
@@ -47,17 +49,11 @@ where
 {
     /// Check whether the signature is valid
     pub fn verify_signature(&self) -> bool {
-        // we should let register just be a reference to an array
-        // then add getters for each field
-        valid(self.address(), self.signed_message(), self.signature())
-    }
-
-    fn range<const START: usize, const LEN: usize>(&self) -> &[u8; LEN] {
-        range::<u8, START, LEN, REGISTER_SIZE>(self.bs.borrow())
+        valid(self.address(), self.signature_target(), self.signature())
     }
 
     pub fn address(&self) -> PublicKey {
-        PublicKey(self.range::<PUBLIC_KEY_START, PUBLIC_KEY_SIZE>())
+        PublicKey(*self.range::<PUBLIC_KEY_START, PUBLIC_KEY_SIZE>())
     }
 
     pub fn socket_address(&self) -> SocketAddr {
@@ -69,11 +65,15 @@ where
     }
 
     pub fn signature(&self) -> Signature {
-        Signature(self.range::<SIGNATURE_START, SIGNATURE_SIZE>())
+        Signature(*self.range::<SIGNATURE_START, SIGNATURE_SIZE>())
     }
 
-    pub fn signed_message(&self) -> &[u8; SIGNATURE_START - SOCKET_ADDRESS_START] {
-        self.range::<SOCKET_ADDRESS_START, { SIGNATURE_START - SOCKET_ADDRESS_START }>()
+    pub fn signature_target(&self) -> &[u8; SIGNATURE_START - PUBLIC_KEY_START] {
+        self.range::<PUBLIC_KEY_START, { SIGNATURE_START - PUBLIC_KEY_START }>()
+    }
+
+    fn range<const START: usize, const LEN: usize>(&self) -> &[u8; LEN] {
+        range::<u8, START, LEN, REGISTER_SIZE>(self.bs.borrow())
     }
 }
 
@@ -81,24 +81,25 @@ impl<T> Register<T>
 where
     T: BorrowMut<[u8; REGISTER_SIZE]>,
 {
+    pub fn set_address(&mut self, address: PublicKey) {
+        *self.range_mut::<PUBLIC_KEY_START, PUBLIC_KEY_SIZE>() = address.0;
+    }
+
+    pub fn set_socket_address(&mut self, socket_address: SocketAddr) {
+        *self.range_mut::<SOCKET_ADDRESS_START, SOCKET_ADDRESS_SIZE>() =
+            write_socketaddr(socket_address);
+    }
+
+    pub fn set_timestamp_nanos(&mut self, timestamp_nanos: u128) {
+        *self.range_mut::<TIMESTAMP_START, TIMESTAMP_SIZE>() = timestamp_nanos.to_be_bytes();
+    }
+
+    pub fn set_signature(&mut self, signature: Signature) {
+        *self.range_mut::<SIGNATURE_START, SIGNATURE_SIZE>() = signature.0;
+    }
+
     fn range_mut<const START: usize, const LEN: usize>(&mut self) -> &mut [u8; LEN] {
         range_mut::<u8, START, LEN, REGISTER_SIZE>(self.bs.borrow_mut())
-    }
-
-    pub fn set_address(&mut self, address: PublicKey) {
-        *self.range_mut::<PUBLIC_KEY_START, PUBLIC_KEY_SIZE>() = *address.0;
-    }
-
-    pub fn set_socket_address(&self, socket_address: SocketAddr) {
-        todo!()
-    }
-
-    pub fn set_timestamp_nanos(&self, timestamp_nanos: u128) {
-        todo!()
-    }
-
-    pub fn set_signature(&self, signature: Signature) {
-        todo!()
     }
 }
 
@@ -137,7 +138,18 @@ fn parse_socketaddr(dat: &[u8; 18]) -> SocketAddr {
 }
 
 fn write_socketaddr(sa: SocketAddr) -> [u8; 18] {
-    todo!()
+    let addr = match sa.ip() {
+        IpAddr::V4(v4) => {
+            let [a, b, c, d] = v4.octets();
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d]
+        }
+        IpAddr::V6(v6) => v6.octets(),
+    };
+    let [porta, portb] = sa.port().to_be_bytes();
+    [
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7], addr[8], addr[9],
+        addr[10], addr[11], addr[12], addr[13], addr[14], addr[15], porta, portb,
+    ]
 }
 
 fn take_array_ref<T, const N: usize>(slice: &[T]) -> Option<(&[T; N], &[T])> {
@@ -152,6 +164,8 @@ fn take_array_ref<T, const N: usize>(slice: &[T]) -> Option<(&[T; N], &[T])> {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
 
     use super::*;
 
@@ -171,7 +185,7 @@ mod tests {
         assert_eq!(
             Forward::parse(&packet).unwrap(),
             Forward {
-                address: PublicKey(&[
+                address: PublicKey([
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
@@ -210,7 +224,7 @@ mod tests {
         let r = Register { bs: &packet };
         assert_eq!(
             r.address(),
-            PublicKey(&[
+            PublicKey([
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x01,
@@ -231,7 +245,7 @@ mod tests {
         assert_eq!(r.timestamp_nanos(), 4);
         assert_eq!(
             r.signature(),
-            Signature(&[
+            Signature([
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -288,18 +302,26 @@ mod tests {
     /// Check that a random signature does not verify.
     #[test]
     fn badsign_verify() {
-        todo!()
-    }
-
-    /// Check that tampered body does not verify.
-    #[test]
-    fn tamper_verify() {
-        todo!()
+        let mut rng = SmallRng::seed_from_u64(0);
+        let backing = [(); REGISTER_SIZE].map(|()| rng.gen::<u8>());
+        assert!(!Register { bs: backing }.verify_signature());
     }
 
     /// Check that properly signed  body does verify.
     #[test]
     fn sign_verify() {
-        todo!()
+        let mut rng = SmallRng::seed_from_u64(0);
+        let mut backing = [(); REGISTER_SIZE].map(|()| rng.gen::<u8>());
+        let mut r = Register { bs: &mut backing };
+        let keypair = Keypair::generate();
+        r.set_address(keypair.public());
+        let sig = keypair.sign(r.signature_target());
+        assert!(!r.verify_signature());
+        r.set_signature(sig);
+        assert!(r.verify_signature());
+
+        // tamper
+        r.set_timestamp_nanos(r.timestamp_nanos() + 1);
+        assert!(!r.verify_signature());
     }
 }
