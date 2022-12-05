@@ -5,6 +5,11 @@ use std::{
 
 use pkip::{PkipPacket, PublicKey};
 
+// TODO:
+//   make this server an exposed library function
+//   implement an example of a process listening on a public key
+//   implement an example of a client sending messages to that process
+
 // be a pkip registry, listen for udp
 //
 // when a register packet is recieved, verify the signature
