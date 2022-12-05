@@ -3,10 +3,10 @@ use std::convert::TryInto;
 use ring::rand;
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub struct PublicKey(pub [u8; 32]);
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub struct Signature(pub [u8; 64]);
 
 pub struct Keypair {
