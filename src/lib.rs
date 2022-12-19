@@ -1,365 +1,128 @@
+mod directory_server;
+mod packet;
 mod signatures;
+mod util;
 
 use std::{
-    borrow::{Borrow, BorrowMut},
-    convert::TryInto,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    iter::once,
+    net::SocketAddr,
+    ops::Range,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use signatures::valid;
+use packet::{Register, PUBLIC_KEY_SIZE, REGISTER_SIZE};
+use tokio::net::UdpSocket;
+use util::take_array_ref;
 
-pub use signatures::{Keypair, PublicKey, Signature};
+pub use directory_server::directory_server;
+pub use packet::{PkipPacket, TAG_REGISTER, TAG_SEND};
+pub use signatures::{KeyPair, PublicKey, Signature};
 
-#[derive(PartialEq, Eq, Debug)]
-pub enum PkipPacket<'a> {
-    Register(Register<&'a [u8; REGISTER_SIZE]>),
-    Forward(Forward<'a>),
+pub struct PlaintextSocket {
+    sock: tokio::net::UdpSocket,
+    addr: PublicKey,
 }
 
-impl<'a> PkipPacket<'a> {
-    pub fn parse(payload: &'a [u8]) -> Option<Self> {
-        let (first, rest) = payload.split_first()?;
-        match first {
-            0 => Some(Self::Forward(Forward::parse(rest)?)),
-            1 => Some(Self::Register(Register {
-                bs: rest.try_into().ok()?,
-            })),
-            _ => return None,
+impl PlaintextSocket {
+    /// Receives a single datagram message on the socket. On success, returns the range
+    /// representing the payload.
+    ///
+    /// The returned range will have a maximum length of `buf.len() - [PUBLIC_KEY_SIZE]`.
+    ///
+    /// The function must be called with valid byte array buf of sufficient size to hold the
+    /// message bytes. If a message is too long to fit in the supplied buffer, excess bytes may be
+    /// discarded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if buf is smaller than [PUBLIC_KEY_SIZE].
+    pub async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<Range<usize>> {
+        assert!(buf.len() >= PUBLIC_KEY_SIZE);
+        loop {
+            let (len, _addr) = self.sock.recv_from(buf).await?;
+            let payload = &buf[..len];
+            let Some((pubkey, _payload)) = take_array_ref::<u8, PUBLIC_KEY_SIZE>(payload) else {
+                // if packet is too small, keep waiting
+                continue;
+            };
+            let pubkey = PublicKey(*pubkey);
+            if self.addr != pubkey {
+                // if packet is not addressed to me, keep waiting
+                continue;
+            }
+            // return the payload only, no address
+            return Ok(PUBLIC_KEY_SIZE..len);
         }
     }
-}
 
-#[derive(PartialEq, Eq, Debug)]
-pub struct Forward<'a> {
-    pub address: PublicKey,
-    pub payload: &'a [u8],
-}
+    pub async fn register(
+        directory_server: SocketAddr,
+        sock: tokio::net::UdpSocket,
+        kp: KeyPair,
+        my_address: SocketAddr,
+    ) -> std::io::Result<Self> {
+        // how do we check whether registration was successful?
+        // - Send a Forward packet to self with a random payload?
+        // - Make a Lookup query?
 
-impl<'a> Forward<'a> {
-    /// return the Forward type packet or None if the input
-    /// is too short
-    pub fn parse(bs: &'a [u8]) -> Option<Self> {
-        let (public_key, payload) = take_array_ref(bs)?;
-        Some(Self {
-            address: PublicKey(*public_key),
-            payload,
+        // for now we don't check
+
+        let mut packet = [0u8; REGISTER_SIZE + 1];
+        let backing: &mut [u8; REGISTER_SIZE] = (&mut packet[1..]).try_into().unwrap();
+        let mut register = Register::parse(backing);
+        register.set_address(kp.public());
+        register.set_socket_address(my_address);
+        register.set_timestamp_nanos(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let sig = kp.sign(register.signature_target());
+        register.set_signature(sig);
+        packet[0] = TAG_REGISTER;
+        sock.send_to(&packet, directory_server).await?;
+        Ok(PlaintextSocket {
+            sock,
+            addr: kp.public(),
         })
     }
-}
 
-#[derive(PartialEq, Eq, Debug)]
-pub struct Register<T> {
-    bs: T,
-}
-
-const PUBLIC_KEY_START: usize = 0;
-const PUBLIC_KEY_SIZE: usize = 32;
-const SOCKET_ADDRESS_START: usize = PUBLIC_KEY_START + PUBLIC_KEY_SIZE;
-const SOCKET_ADDRESS_SIZE: usize = 18;
-const TIMESTAMP_START: usize = SOCKET_ADDRESS_START + SOCKET_ADDRESS_SIZE;
-const TIMESTAMP_SIZE: usize = 16;
-const SIGNATURE_START: usize = TIMESTAMP_START + TIMESTAMP_SIZE;
-const SIGNATURE_SIZE: usize = 64;
-const REGISTER_SIZE: usize = SIGNATURE_START + SIGNATURE_SIZE;
-
-impl<T> Register<T>
-where
-    T: Borrow<[u8; REGISTER_SIZE]>,
-{
-    /// Check whether the signature is valid
-    pub fn verify_signature(&self) -> bool {
-        valid(self.address(), self.signature_target(), self.signature())
+    pub fn unregisted(sock: tokio::net::UdpSocket, addr: PublicKey) -> Self {
+        PlaintextSocket { sock, addr }
     }
 
-    pub fn address(&self) -> PublicKey {
-        PublicKey(*self.range::<PUBLIC_KEY_START, PUBLIC_KEY_SIZE>())
-    }
-
-    pub fn socket_address(&self) -> SocketAddr {
-        parse_socketaddr(self.range::<SOCKET_ADDRESS_START, SOCKET_ADDRESS_SIZE>())
-    }
-
-    pub fn timestamp_nanos(&self) -> u128 {
-        u128::from_be_bytes(*self.range::<TIMESTAMP_START, TIMESTAMP_SIZE>())
-    }
-
-    pub fn signature(&self) -> Signature {
-        Signature(*self.range::<SIGNATURE_START, SIGNATURE_SIZE>())
-    }
-
-    pub fn signature_target(&self) -> &[u8; SIGNATURE_START - PUBLIC_KEY_START] {
-        self.range::<PUBLIC_KEY_START, { SIGNATURE_START - PUBLIC_KEY_START }>()
-    }
-
-    fn range<const START: usize, const LEN: usize>(&self) -> &[u8; LEN] {
-        range::<u8, START, LEN, REGISTER_SIZE>(self.bs.borrow())
-    }
-}
-
-impl<T> Register<T>
-where
-    T: BorrowMut<[u8; REGISTER_SIZE]>,
-{
-    pub fn set_address(&mut self, address: PublicKey) {
-        *self.range_mut::<PUBLIC_KEY_START, PUBLIC_KEY_SIZE>() = address.0;
-    }
-
-    pub fn set_socket_address(&mut self, socket_address: SocketAddr) {
-        *self.range_mut::<SOCKET_ADDRESS_START, SOCKET_ADDRESS_SIZE>() =
-            write_socketaddr(socket_address);
-    }
-
-    pub fn set_timestamp_nanos(&mut self, timestamp_nanos: u128) {
-        *self.range_mut::<TIMESTAMP_START, TIMESTAMP_SIZE>() = timestamp_nanos.to_be_bytes();
-    }
-
-    pub fn set_signature(&mut self, signature: Signature) {
-        *self.range_mut::<SIGNATURE_START, SIGNATURE_SIZE>() = signature.0;
-    }
-
-    fn range_mut<const START: usize, const LEN: usize>(&mut self) -> &mut [u8; LEN] {
-        range_mut::<u8, START, LEN, REGISTER_SIZE>(self.bs.borrow_mut())
-    }
-}
-
-fn range<T, const START: usize, const LEN: usize, const CONTAINER: usize>(
-    bs: &[T; CONTAINER],
-) -> &[T; LEN] {
-    assert!(START + LEN <= CONTAINER);
-    bs[START..(START + LEN)].try_into().unwrap()
-}
-
-fn range_mut<T, const START: usize, const LEN: usize, const CONTAINER: usize>(
-    bs: &mut [T; CONTAINER],
-) -> &mut [T; LEN] {
-    assert!(START + LEN <= CONTAINER);
-    bs.get_mut(START..(START + LEN))
-        .unwrap()
-        .try_into()
-        .unwrap()
-}
-
-fn parse_socketaddr(dat: &[u8; 18]) -> SocketAddr {
-    let (addr, port) = dat.split_at(16);
-
-    // ipv4 addresses are supported via ipv4-mapped ipv6 addresses
-    let addr: [u8; 16] = addr.try_into().unwrap();
-    let addr = Ipv6Addr::from(addr);
-    let addr = match addr.to_ipv4_mapped() {
-        Some(ipv4) => IpAddr::V4(ipv4),
-        None => IpAddr::V6(addr),
-    };
-
-    let port: [u8; 2] = port.try_into().unwrap();
-    let port = u16::from_be_bytes(port);
-
-    SocketAddr::new(addr, port)
-}
-
-fn canonical_ipv6(ip: IpAddr) -> [u8; 16] {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, c, d] = v4.octets();
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d]
+    pub async fn send(
+        src_sock: &UdpSocket,
+        directory_server: SocketAddr,
+        dest: PublicKey,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let pack: Vec<u8> = once(TAG_SEND)
+            .chain(dest.0)
+            .chain(payload.iter().copied())
+            .collect();
+        let sent = src_sock.send_to(&pack, directory_server).await?;
+        if sent < payload.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "full packet was not written",
+            ));
         }
-        IpAddr::V6(v6) => v6.octets(),
+        Ok(())
     }
 }
 
-fn write_socketaddr(sa: SocketAddr) -> [u8; 18] {
-    let addr = canonical_ipv6(sa.ip());
-    let [porta, portb] = sa.port().to_be_bytes();
-    [
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7], addr[8], addr[9],
-        addr[10], addr[11], addr[12], addr[13], addr[14], addr[15], porta, portb,
-    ]
-}
+// pub struct DirectoryClient {
+//     // server: SocketAddr,
+// }
 
-fn take_array_ref<T, const N: usize>(slice: &[T]) -> Option<(&[T; N], &[T])> {
-    if slice.len() < N {
-        return None;
-    }
-    let (a, b) = slice.split_at(N);
-    let a = a.try_into().unwrap();
-    Some((a, b))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
-
-    use rand::{rngs::SmallRng, Rng, SeedableRng};
-
-    use super::*;
-
-    #[rustfmt::skip]
-    const REGISTER_PACKET: [u8; REGISTER_SIZE + 1] = [
-        0x01,                                           // ] tag == 0x01 identifies packet as register
-                                                        //
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] public key
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // ]
-                                                        //
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] ipv6 addr ] socket addr ] signature target
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]           ]             ]
-                                                        //             ]             ]
-        0x00, 0x03,                                     // ] port      ]             ]
-                                                        //                           ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] timestamp nanos         ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, // ]                         ]
-                                                        //
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] signature
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // ]
-    ];
-
-    #[rustfmt::skip]
-    const FORWARD_PACKET: &[u8] = &[
-        0x00,                                           // ] tag == 0x00 identifies packet as forward
-                                                        //
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ] public key
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ]
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // ]
-                                                        //
-        0x02,                                           // ] payload, has arbitrary length
-    ];
-
-    #[test]
-    fn parse_forward() {
-        let packet = PkipPacket::parse(FORWARD_PACKET).unwrap();
-        assert_eq!(
-            packet,
-            PkipPacket::Forward(Forward {
-                address: PublicKey([
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-                ]),
-                payload: &[0x02]
-            })
-        )
-    }
-
-    #[test]
-    fn parse_register() {
-        match PkipPacket::parse(&REGISTER_PACKET) {
-            Some(PkipPacket::Register(_)) => {}
-            _ => panic!(),
-        }
-    }
-
-    #[test]
-    fn parse_register_fields() {
-        let r = Register::<&[u8; REGISTER_SIZE]> {
-            bs: REGISTER_PACKET[1..].try_into().unwrap(),
-        };
-        assert_eq!(
-            r.address(),
-            PublicKey([
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x01,
-            ])
-        );
-        assert_eq!(
-            r.socket_address(),
-            SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from([
-                    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00,
-                ]),
-                0x0003,
-                0,
-                0,
-            ))
-        );
-        assert_eq!(r.timestamp_nanos(), 4);
-        assert_eq!(
-            r.signature(),
-            Signature([
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
-            ])
-        );
-    }
-
-    #[test]
-    fn socketaddr_parse() {
-        assert_eq!(
-            parse_socketaddr(&[
-                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x06,
-            ]),
-            SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from([
-                    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00,
-                ]),
-                0x0006,
-                0,
-                0,
-            )),
-        );
-        assert_eq!(
-            parse_socketaddr(&[
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00,
-                0x00, 0x07, 0x00, 0x06,
-            ]),
-            SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from([0x00, 0x00, 0x00, 0x07]),
-                0x0006
-            )),
-        );
-        assert_eq!(
-            parse_socketaddr(&[
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-            ]),
-            SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from([
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00,
-                ]),
-                0x0000,
-                0,
-                0,
-            ))
-        );
-    }
-
-    /// Check that a random signature does not verify.
-    #[test]
-    fn badsign_verify() {
-        let mut rng = SmallRng::seed_from_u64(0);
-        let backing = [(); REGISTER_SIZE].map(|()| rng.gen::<u8>());
-        assert!(!Register { bs: backing }.verify_signature());
-    }
-
-    /// Check that properly signed  body does verify.
-    #[test]
-    fn sign_verify() {
-        let mut rng = SmallRng::seed_from_u64(0);
-        let mut backing = [(); REGISTER_SIZE].map(|()| rng.gen::<u8>());
-        let mut r = Register { bs: &mut backing };
-        let keypair = Keypair::generate();
-        r.set_address(keypair.public());
-        let sig = keypair.sign(r.signature_target());
-        assert!(!r.verify_signature());
-        r.set_signature(sig);
-        assert!(r.verify_signature());
-
-        // tamper
-        r.set_timestamp_nanos(r.timestamp_nanos() + 1);
-        assert!(!r.verify_signature());
-    }
-}
+// consider an "Introduce Us" packet sent from the application client to the directory server
+//
+// appclient                   directory server                      appserver
+//    |      --introduce us-->       |                                   |
+//    |                              |          --register client-->     |
+//    |      <----------------------------------------------hello------  |
+//
+// Maybe this can be built atop on the "relay" functionality. Maybe the directory server doesn't
+// need to know about "introductions".

@@ -1,7 +1,7 @@
 use std::convert::TryInto;
 
 use ring::rand;
-use ring::signature::{self, Ed25519KeyPair, KeyPair};
+use ring::signature::{self, Ed25519KeyPair, KeyPair as _};
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub struct PublicKey(pub [u8; 32]);
@@ -9,11 +9,11 @@ pub struct PublicKey(pub [u8; 32]);
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub struct Signature(pub [u8; 64]);
 
-pub struct Keypair {
+pub struct KeyPair {
     kp: Ed25519KeyPair,
 }
 
-impl Keypair {
+impl KeyPair {
     pub fn generate() -> Self {
         let rng = rand::SystemRandom::new();
         let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
@@ -39,16 +39,16 @@ pub fn valid(public_key: PublicKey, message: &[u8], sig: Signature) -> bool {
 
 #[cfg(test)]
 mod test {
-    use crate::{signatures::valid, Keypair};
+    use super::{valid, KeyPair};
 
     #[test]
     fn sigs() {
         let payload = [1u8];
-        let kp = Keypair::generate();
+        let kp = KeyPair::generate();
         let sig = kp.sign(&payload);
 
         assert!(valid(kp.public(), &payload, sig));
         assert!(!valid(kp.public(), &[], sig));
-        assert!(!valid(Keypair::generate().public(), &[], sig));
+        assert!(!valid(KeyPair::generate().public(), &[], sig));
     }
 }
