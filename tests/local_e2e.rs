@@ -2,7 +2,7 @@ use futures::future::select;
 use std::{net::Ipv6Addr, time::Duration};
 use tokio::net::UdpSocket;
 
-use pkip::{directory_server, KeyPair, PlaintextSocket, PublicKey};
+use pkip::{directory_server, legacy::PlaintextSocket, KeyPair, PublicKey};
 
 /// Test example does not encrypt or authenticate traffic. It's just testing routing.
 #[tokio::test]
