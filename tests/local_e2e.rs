@@ -1,12 +1,15 @@
 use futures::future::select;
 use std::{net::Ipv6Addr, time::Duration};
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, time::sleep};
 
-use pkip::{directory_server, legacy::PlaintextSocket, KeyPair, PublicKey};
+use pkip::{
+    directory_server, recv_plaintext, register_unreliable, send_plaintext, KeyPair, PublicKey,
+    PUBLIC_KEY_SIZE,
+};
 
 /// Test example does not encrypt or authenticate traffic. It's just testing routing.
 #[tokio::test]
-async fn foo() {
+async fn plaintext_end_to_end() {
     let port_unspecified = 0;
 
     // start directory server
@@ -22,24 +25,27 @@ async fn foo() {
     let app_server_kp = KeyPair::generate();
     let app_server_pk = app_server_kp.public();
     let application_server = async {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(1)).await;
         let sock = UdpSocket::bind((Ipv6Addr::LOCALHOST, port_unspecified))
             .await
             .unwrap();
-        let my_addr = sock.local_addr().unwrap();
-        let sock = PlaintextSocket::register(dir_server_addr, sock, app_server_kp, my_addr)
-            .await
-            .unwrap();
-        let sending_sock = UdpSocket::bind((Ipv6Addr::LOCALHOST, port_unspecified))
-            .await
-            .unwrap();
+
+        register_unreliable(
+            &sock,
+            dir_server_addr,
+            &app_server_kp,
+            sock.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
 
         let mut buf = vec![0; u16::max_value() as usize];
         loop {
-            let range = sock.recv_from(&mut buf).await.unwrap();
-            let (return_addr, message) = buf[range].split_at(32);
+            let (dest_pk, len) = recv_plaintext(&sock, &mut buf).await.unwrap();
+            assert_eq!(dest_pk, app_server_kp.public());
+            let (return_addr, message) = buf[..len].split_at(PUBLIC_KEY_SIZE);
             let return_addr: PublicKey = PublicKey(return_addr.try_into().unwrap());
-            PlaintextSocket::send(&sending_sock, dir_server_addr, return_addr, message)
+            send_plaintext(&sock, dir_server_addr, return_addr, message)
                 .await
                 .unwrap();
         }
@@ -47,38 +53,34 @@ async fn foo() {
 
     // start client
     let application_client = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(2)).await;
 
         let kp = KeyPair::generate();
-        let my_pk = kp.public();
-        let recv = UdpSocket::bind((Ipv6Addr::LOCALHOST, port_unspecified))
+        let sock = UdpSocket::bind((Ipv6Addr::LOCALHOST, port_unspecified))
             .await
             .unwrap();
-        let my_addr = recv.local_addr().unwrap();
-        let recv = PlaintextSocket::register(dir_server_addr, recv, kp, my_addr)
-            .await
-            .unwrap();
-
-        let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, port_unspecified))
+        register_unreliable(&sock, dir_server_addr, &kp, sock.local_addr().unwrap())
             .await
             .unwrap();
 
-        let payload: Vec<u8> = my_pk.0.iter().chain(b"Hello Worl").copied().collect();
+        let greet = b"Hello Worl";
 
-        PlaintextSocket::send(&send, dir_server_addr, app_server_pk, &payload)
+        let message: Vec<u8> = kp.public().0.iter().chain(greet).copied().collect();
+        send_plaintext(&sock, dir_server_addr, app_server_pk, &message)
             .await
             .unwrap();
 
         let mut buf = vec![0; u16::max_value() as usize];
-        let range = recv.recv_from(&mut buf).await.unwrap();
-        assert_eq!(&buf[range], b"Hello Worl");
+        let (dest, len) = recv_plaintext(&sock, &mut buf).await.unwrap();
+        assert_eq!(dest, kp.public());
+        assert_eq!(&buf[..len], greet);
     };
 
     let allem = select(
         select(Box::pin(directory_server), Box::pin(application_server)),
         Box::pin(application_client),
     );
-    tokio::time::timeout(Duration::from_millis(1000), allem)
+    tokio::time::timeout(Duration::from_millis(10), allem)
         .await
         .unwrap();
 }

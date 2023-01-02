@@ -38,14 +38,14 @@ pub async fn directory_server(sock: tokio::net::UdpSocket) -> std::io::Result<()
                 }
                 let timestamp = r.timestamp_nanos();
                 let val = registry
-                    .entry(r.address())
+                    .entry(r.signing_key())
                     .or_insert_with(|| (timestamp, socket_address));
                 if val.0 < timestamp {
                     *val = (timestamp, socket_address);
                 }
             }
             PkipPacket::Send(f) => {
-                let Some((_, socket_address)) = registry.get(&f.address()) else {
+                let Some((_, socket_address)) = registry.get(&f.destination_signing_key()) else {
                     continue;
                 };
 

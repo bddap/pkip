@@ -1,10 +1,14 @@
 use std::{
     borrow::{Borrow, BorrowMut},
     convert::TryInto,
+    iter::once,
     net::{IpAddr, Ipv6Addr, SocketAddr},
 };
 
-use crate::signatures::{valid, PublicKey, Signature};
+use crate::{
+    signatures::{valid, PublicKey, Signature},
+    KeyPair,
+};
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum PkipPacket<'a> {
@@ -26,6 +30,34 @@ impl<'a> PkipPacket<'a> {
             _ => None,
         }
     }
+
+    /// Create and sign a registration packet.
+    pub fn register(
+        id: &KeyPair,
+        my_addr: SocketAddr,
+        timestamp_nanos: u128,
+    ) -> [u8; REGISTER_SIZE + 1] {
+        let mut ret = [0u8; REGISTER_SIZE + 1];
+        ret[0] = TAG_REGISTER;
+        let register_section: &mut [u8; REGISTER_SIZE] = (&mut ret[1..]).try_into().unwrap();
+        let mut reg = Register {
+            bs: register_section,
+        };
+        reg.set_address(id.public());
+        reg.set_socket_address(my_addr);
+        reg.set_timestamp_nanos(timestamp_nanos);
+        let sig = id.sign(reg.signature_target());
+        reg.set_signature(sig);
+        ret
+    }
+
+    /// Create a forward packet. Does allocate.
+    pub fn send(destination: PublicKey, payload: &[u8]) -> Vec<u8> {
+        once(TAG_SEND)
+            .chain(destination.0)
+            .chain(payload.into_iter().copied())
+            .collect()
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -44,7 +76,9 @@ impl<'a> Send<'a> {
         }
     }
 
-    pub fn address(&self) -> PublicKey {
+    /// return the singing key of the process to which this packet
+    /// should be sent
+    pub fn destination_signing_key(&self) -> PublicKey {
         PublicKey(self.bs[..PUBLIC_KEY_SIZE].try_into().unwrap())
     }
 
@@ -85,10 +119,14 @@ where
 {
     /// Check whether the signature is valid
     pub fn verify_signature(&self) -> bool {
-        valid(self.address(), self.signature_target(), self.signature())
+        valid(
+            self.signing_key(),
+            self.signature_target(),
+            self.signature(),
+        )
     }
 
-    pub fn address(&self) -> PublicKey {
+    pub fn signing_key(&self) -> PublicKey {
         PublicKey(*self.range::<PUBLIC_KEY_START, PUBLIC_KEY_SIZE>())
     }
 
@@ -246,7 +284,7 @@ mod tests {
             panic!();
         };
         assert_eq!(
-            send.address(),
+            send.destination_signing_key(),
             PublicKey([
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -254,6 +292,23 @@ mod tests {
             ])
         );
         assert_eq!(send.payload(), &[0x02])
+    }
+
+    #[test]
+    fn construct_register() {
+        let kp = KeyPair::generate();
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 3, 0, 0));
+        let timestamp_nanos = rand::random();
+        let register = PkipPacket::register(&kp, addr, timestamp_nanos);
+        let packet = PkipPacket::parse(&register).unwrap();
+        let packet = match packet {
+            PkipPacket::Register(r) => r,
+            PkipPacket::Send(_) => panic!(),
+        };
+        assert_eq!(packet.signing_key(), kp.public());
+        assert_eq!(packet.socket_address(), addr);
+        assert_eq!(packet.timestamp_nanos(), timestamp_nanos);
+        assert!(packet.verify_signature());
     }
 
     #[test]
@@ -270,7 +325,7 @@ mod tests {
             bs: REGISTER_PACKET[1..].try_into().unwrap(),
         };
         assert_eq!(
-            r.address(),
+            r.signing_key(),
             PublicKey([
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

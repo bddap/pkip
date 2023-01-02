@@ -17,15 +17,12 @@
 //! Method one, user creates a custom [Pkip] object rather than using the global one.
 //! Method two, user sets the `PKIP_DIRECTORIES` env var or similar.
 
+mod center;
 mod directory_server;
 mod packet;
-mod pkip;
 mod signatures;
-mod util;
 
-pub mod legacy;
-
+pub use center::{recv_plaintext, register_unreliable, send_plaintext};
 pub use directory_server::directory_server;
-pub use packet::{PkipPacket, TAG_REGISTER, TAG_SEND};
-pub use pkip::Pkip;
+pub use packet::{PkipPacket, PUBLIC_KEY_SIZE, TAG_REGISTER, TAG_SEND};
 pub use signatures::{KeyPair, PublicKey, Signature};
