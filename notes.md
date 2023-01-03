@@ -47,5 +47,31 @@ over the design or iteration of the protocol. {{Citation needed}}
 https://en.wikipedia.org/wiki/Public_key_infrastructure
 https://en.wikipedia.org/wiki/Blockchain
 
+## What's my ip?
 
+Processes don't always know their public ip (and port?). Current implenentaion requires knowlege of public ip
+in order to register. We could:
+1. Ping an external service to get public ip.
+2. Add an endpoint to directory server the echoes sender ip and port.
+3. Add an endpoint to to register without knowing ip.
 
+Option 1 assumes users are on the public internet. This may not always be the case.
+
+Option 2 requires an additional round-trip. Remember at this level we don't have relaible datagrams so a round
+trip is extra complex.
+
+### Option 3
+
+Seems like the best option so far. Should the old register packet be left in? It seems like
+it would be nice to have when a process does actually know it's ip, or when a process is to be registered
+by a different host. It's an extra option, that's costly. It's an extra choice for users to make, that's
+costly. Allowing both kinds of registration packet would probably mean we need to add prefixes to signature
+to avoind reinterpretation attacks.
+
+Security-wise, if an attacker gets a hold of a registration packet without a signed address they can register
+their own address. Is this a problem? Maybe.
+
+Should the signature in the registration packet include the address of the directory server?
+
+Assuming registration packets without signed addresses, are signatures even useful anymore? Maybe, if only for
+the timestamp.

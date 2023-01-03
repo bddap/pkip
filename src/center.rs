@@ -20,6 +20,7 @@ pub async fn send_plaintext(
 ) -> io::Result<()> {
     // This function allocates. Can we make a non-allocating version of this function
     // that is pleasant to use?
+    // perhaps https://docs.rs/bytes/latest/bytes/struct.Bytes.html
     let payload = PkipPacket::send(dest, message);
     let sent = sock.send_to(&payload, directory_server).await?;
     if sent < payload.len() {
@@ -40,6 +41,7 @@ pub async fn send_plaintext(
 pub async fn recv_plaintext(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<(PublicKey, usize)> {
     // This function allocates. Can we make a non-allocating version of this function
     // that is pleasant to use?
+    // perhaps https://docs.rs/bytes/latest/bytes/struct.Bytes.html
     let mut payload = vec![0u8; buf.len() + PUBLIC_KEY_SIZE];
     loop {
         let (len, _addr) = sock.recv_from(&mut payload).await?;
