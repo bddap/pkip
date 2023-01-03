@@ -32,6 +32,9 @@ enum Args {
         /// Otherwise use a local address.
         #[arg(short, long)]
         my_addr: Option<SocketAddr>,
+
+        #[arg(short, long)]
+        listen_on: Option<SocketAddr>,
     },
     #[command(arg_required_else_help = true)]
     AppClient {
@@ -39,10 +42,14 @@ enum Args {
         directory_server: SocketAddr,
         #[arg(short, long)]
         load_pubkey: PathBuf,
+
         /// If provided, register with directory server using this address.
         /// Otherwise use a local address.
         #[arg(short, long)]
         my_addr: Option<SocketAddr>,
+
+        #[arg(short, long)]
+        listen_on: Option<SocketAddr>,
     },
 }
 
@@ -60,15 +67,17 @@ async fn main() {
             directory_server,
             save_pubkey,
             my_addr,
+            listen_on,
         } => {
-            run_app_server(directory_server, save_pubkey, my_addr).await;
+            run_app_server(directory_server, save_pubkey, my_addr, listen_on).await;
         }
         Args::AppClient {
             directory_server,
             load_pubkey,
             my_addr,
+            listen_on,
         } => {
-            run_client(directory_server, load_pubkey, my_addr).await;
+            run_client(directory_server, load_pubkey, my_addr, listen_on).await;
         }
     }
 }
@@ -83,11 +92,11 @@ async fn run_app_server(
     directory_server: SocketAddr,
     dump_pubkey: PathBuf,
     my_addr: Option<SocketAddr>,
+    listen_on: Option<SocketAddr>,
 ) {
-    let sock = UdpSocket::bind(my_addr.unwrap_or(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0)))
-        .await
-        .unwrap();
-    let my_addr = sock.local_addr().unwrap();
+    let listen_on = listen_on.unwrap_or(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0));
+    let sock = UdpSocket::bind(listen_on).await.unwrap();
+    let my_addr = my_addr.unwrap_or_else(|| sock.local_addr().unwrap());
 
     let id = KeyPair::generate();
 
@@ -124,12 +133,11 @@ async fn run_client(
     directory_server: SocketAddr,
     load_pubkey: PathBuf,
     my_addr: Option<SocketAddr>,
+    listen_on: Option<SocketAddr>,
 ) {
-    let sock = UdpSocket::bind(my_addr.unwrap_or(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0)))
-        .await
-        .unwrap();
-    let my_addr = sock.local_addr().unwrap();
-    eprintln!("{}", &my_addr);
+    let listen_on = listen_on.unwrap_or(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0));
+    let sock = UdpSocket::bind(listen_on).await.unwrap();
+    let my_addr = my_addr.unwrap_or_else(|| sock.local_addr().unwrap());
 
     let app_server_pk = read(load_pubkey).await.unwrap();
     let app_server_pk = PublicKey(app_server_pk.try_into().unwrap());

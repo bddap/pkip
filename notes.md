@@ -56,6 +56,7 @@ in order to register. We could:
 3. Add an endpoint to to register without knowing ip.
 
 Option 1 assumes users are on the public internet. This may not always be the case.
+Option 1 might not even work at all for processes behing nat because they may not know their return port.
 
 Option 2 requires an additional round-trip. Remember at this level we don't have relaible datagrams so a round
 trip is extra complex.
