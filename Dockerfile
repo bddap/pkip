@@ -1,3 +1,5 @@
+# This file describes the live version of the pkip directory server reference implementation.
+
 FROM rust:1.66 as builder
 WORKDIR /usr/src/app
 COPY . .
